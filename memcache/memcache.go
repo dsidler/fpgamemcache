@@ -22,14 +22,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"io/ioutil"
 	"net"
 
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+   "encoding/binary"
 )
 
 // Similar to:
@@ -64,13 +63,18 @@ var (
 	ErrNoServers = errors.New("memcache: no servers configured or available")
 )
 
-// DefaultTimeout is the default socket read/write timeout.
-const DefaultTimeout = 100 * time.Millisecond
+
 
 const (
-	buffered            = 8 // arbitrary buffered channel size, for readability
-	maxIdleConnsPerAddr = 2 // TODO(bradfitz): make this configurable?
+   // DefaultTimeout is the default socket read/write timeout.
+   DefaultTimeout      = 100 * time.Millisecond
+
+   // DefaultMaxIdleConns is the default maximum number of idle connections
+   // kept for any single address
+   DefaultMaxIdleConns = 2
 )
+
+const buffered = 8 // arbitrary buffered channel size, for readability
 
 // resumableError returns true if err is only a protocol-level cache error.
 // This is used to determine whether or not a server connection should
@@ -132,6 +136,14 @@ type Client struct {
 	// Timeout specifies the socket read/write timeout.
 	// If zero, DefaultTimeout is used.
 	Timeout time.Duration
+
+   // MaxIdleConns specifies the maximum number of idle connections that will
+   // be maintained per address. If less than one, DefaultMaxIdleConns will be
+   // used.
+   //
+   // Consider your expected traffic rates and latency carefully. This should
+   // be set to a number higher than your peak parallel requests.
+   MaxIdleConns int
 
 	selector ServerSelector
 
@@ -196,7 +208,7 @@ func (c *Client) putFreeConn(addr net.Addr, cn *conn) {
 		c.freeconn = make(map[string][]*conn)
 	}
 	freelist := c.freeconn[addr.String()]
-	if len(freelist) >= maxIdleConnsPerAddr {
+	if len(freelist) >= c.maxIdleConns() {
 		cn.nc.Close()
 		return
 	}
@@ -223,6 +235,13 @@ func (c *Client) netTimeout() time.Duration {
 		return c.Timeout
 	}
 	return DefaultTimeout
+}
+
+func (c *Client) maxIdleConns() int {
+   if c.MaxIdleConns > 0 {
+      return c.MaxIdleConns
+   }
+   return DefaultMaxIdleConns
 }
 
 // ConnectTimeoutError is the error type used when it takes
@@ -300,10 +319,24 @@ func (c *Client) Get(key string) (item *Item, err error) {
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
 		return c.getFromAddr(addr, []string{key}, func(it *Item) { item = it })
 	})
-	if err == nil && item == nil {
+	/*if err == nil && item == nil {
 		err = ErrCacheMiss
-	}
+	}*/
 	return
+}
+
+// Ret, regular expression get
+func (c *Client) Ret(ritem *Item) (item *Item, err error) {
+   if len(ritem.Value) != 32 {
+      return nil, fmt.Errorf("memcache: unexpected value length in ret request: %s", ritem.Value)
+   }
+   err = c.withKeyAddr(ritem.Key, func(addr net.Addr) error {
+      return c.retFromAddr(addr, ritem, func(it *Item) { item = it })
+   })
+   if err == nil && item == nil {
+      err = ErrCacheMiss
+   }
+   return
 }
 
 // Touch updates the expiry for the given key. The seconds parameter is either
@@ -344,9 +377,31 @@ func (c *Client) withKeyRw(key string, fn func(*bufio.ReadWriter) error) error {
 
 func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
-		if _, err := fmt.Fprintf(rw, "gets %s\r\n", strings.Join(keys, " ")); err != nil {
+      // Add Zsolt header
+      padding := []byte{0, 0, 0, 0, 0, 0, 0, 0}
+      padLen := 0
+      mheader := fmt.Sprintf("get %s\r\n", strings.Join(keys, " "))
+      length := len(mheader)
+      if length % 8 != 0 {
+         padLen = 8 - (length % 8)
+      }
+      length += padLen
+      length /= 8
+      zheader := []byte{0xFF, 0xFF, 0, 0, byte(length), 0, 0, 0, 
+                       0, 0, 0, 0, 0, 0, 0, 0}
+
+      if _, err := rw.Write(zheader); err != nil {
+         return err
+      }
+
+		if _, err := fmt.Fprintf(rw, "%s", mheader); err != nil {
 			return err
 		}
+      if padLen != 0 {
+         if _, err := rw.Write(padding[0:padLen]); err != nil {
+            return err
+         }
+      }
 		if err := rw.Flush(); err != nil {
 			return err
 		}
@@ -356,6 +411,50 @@ func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error
 		return nil
 	})
 }
+
+func (c *Client) retFromAddr(addr net.Addr, item *Item, cb func(*Item)) error {
+	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
+      // Add Zsolt header
+      padding := []byte{0, 0, 0, 0, 0, 0, 0, 0}
+      padLen := 0
+      mheader := fmt.Sprintf("ret %s 0 0 32\r\n", item.Key)
+      length := len(mheader) + 34
+      if length % 8 != 0 {
+         padLen = 8 - (length % 8)
+      }
+      length += padLen
+      length /= 8
+      zheader := []byte{0xFF, 0xFF, 0, 0, byte(length), 0, 0, 0, 
+                       0, 0, 0, 0, 0, 0, 0, 0}
+
+      if _, err := rw.Write(zheader); err != nil {
+         return err
+      }
+
+		if _, err := fmt.Fprintf(rw, "%s", mheader); err != nil {
+			return err
+		}
+      if _,err := rw.Write(item.Value); err != nil {
+         return err
+      }
+      if _, err := rw.Write(crlf); err != nil {
+		   return err
+	   }
+      if padLen != 0 {
+         if _, err := rw.Write(padding[0:padLen]); err != nil {
+            return err
+         }
+      }
+		if err := rw.Flush(); err != nil {
+			return err
+		}
+		if err := parseGetResponse(rw.Reader, cb); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 
 // flushAllFromAddr send the flush_all command to the given addr
 func (c *Client) flushAllFromAddr(addr net.Addr) error {
@@ -450,20 +549,26 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
 func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
-	for {
-		line, err := r.ReadSlice('\n')
+   
+   if _, err := r.Discard(8); err != nil {
+      return err
+   }
+	for {		
+      line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
 		}
 		if bytes.Equal(line, resultEnd) {
 			return nil
 		}
-		it := new(Item)
+		/*it := new(Item)
 		size, err := scanGetResponseLine(line, it)
 		if err != nil {
 			return err
 		}
-		it.Value, err = ioutil.ReadAll(io.LimitReader(r, int64(size)+2))
+		//it.Value, err = ioutil.ReadAll(io.LimitReader(r, int64(size)+2))
+      it.Value = make([]byte, int64(size) + 2)
+      _, err = io.ReadFull(r, it.Value)
 		if err != nil {
 			return err
 		}
@@ -471,7 +576,7 @@ func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
 			return fmt.Errorf("memcache: corrupt get result read")
 		}
 		it.Value = it.Value[:size]
-		cb(it)
+		cb(it)*/
 	}
 }
 
@@ -495,6 +600,14 @@ func scanGetResponseLine(line []byte, it *Item) (size int, err error) {
 func (c *Client) Set(item *Item) error {
 	return c.onItem(item, (*Client).set)
 }
+
+
+func (c *Client) SetJSON(item *Item) error { 
+   head := make([]byte, 2)
+   binary.LittleEndian.PutUint16(head, uint16(len(item.Value)))
+   item.Value = append(head, item.Value[:]...)
+   return c.Set(item)                             
+}   
 
 func (c *Client) set(rw *bufio.ReadWriter, item *Item) error {
 	return c.populateOne(rw, "set", item)
@@ -539,13 +652,34 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 	if !legalKey(item.Key) {
 		return ErrMalformedKey
 	}
+   // Change for Zsolts protocol
+   padding := []byte{0, 0, 0, 0, 0, 0, 0, 0}
+   padLen := 0
+
 	var err error
 	if verb == "cas" {
 		_, err = fmt.Fprintf(rw, "%s %s %d %d %d %d\r\n",
 			verb, item.Key, item.Flags, item.Expiration, len(item.Value), item.casid)
 	} else {
-		_, err = fmt.Fprintf(rw, "%s %s %d %d %d\r\n",
-			verb, item.Key, item.Flags, item.Expiration, len(item.Value))
+      //Changed for Zsolts protocol
+      mheader := fmt.Sprintf("%s %s %d %d %d\r\n",
+            verb, item.Key, item.Flags, item.Expiration, len(item.Value))
+
+      length := len(mheader) + len(item.Value) + 2
+      if length % 8 != 0 {
+         padLen = 8 - (length % 8)
+      }
+      length += padLen
+      length /= 8
+      zheader := []byte{0xFF, 0xFF, 0, 0, byte(length), 0, 0, 0, 
+                       0, 0, 0, 0, 0, 0, 0, 0}
+      _, err = rw.Write(zheader)
+      if err != nil {
+         return err
+      }
+		_, err = fmt.Fprintf(rw, "%s", mheader)
+            //verb, item.Key, item.Flags, item.Expiration, len(item.Value))
+
 	}
 	if err != nil {
 		return err
@@ -556,9 +690,18 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
 	if _, err := rw.Write(crlf); err != nil {
 		return err
 	}
+   if padLen != 0 {
+      if _, err := rw.Write(padding[0:padLen]); err != nil {
+         return err
+      }
+   }
 	if err := rw.Flush(); err != nil {
 		return err
 	}
+   //Zsolt Discard 8 dummy bytes
+   if _, err := rw.Discard(8); err != nil {
+      return err
+   }
 	line, err := rw.ReadSlice('\n')
 	if err != nil {
 		return err
