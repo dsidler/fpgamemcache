@@ -7,5 +7,5 @@ The library is adapted to support a prototype protocol.
 
 ### Using *go get*
 
-    $ go get github.com/dsidler/fpgamemcache.git
+    $ go get github.com/dsidler/fpgamemcache/memcache
 
