@@ -9,3 +9,5 @@ The library is adapted to support a prototype protocol.
 
     $ go get github.com/dsidler/fpgamemcache/memcache
 
+## Build example client
+    $ go build github.com/dsidler/fpgamemcache
