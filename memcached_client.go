@@ -1,7 +1,7 @@
 package main
 
 import (
-   "github.com/bradfitz/gomemcache/memcache"
+   "github.com/dsidler/fpgamemcache/memcache"
    "fmt"
    "os"
    "sync"
@@ -36,9 +36,9 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, numRuns int, 
          }
       } else {
          key := "foobarbafoobarba"
-         value := []byte("0123456789abcdef0123456789abcdef")
-         //_, err := mc.Get(key)
-         _, err := mc.Ret(&memcache.Item{Key: key, Value: value})
+         //value := []byte("0123456789abcdef0123456789abcdef")
+         _, err := mc.Get(key)
+         //_, err := mc.Ret(&memcache.Item{Key: key, Value: value})
          if err != nil {
             fmt.Println("Error on get: ", err.Error())
             os.Exit(1)
@@ -71,8 +71,8 @@ func main() {
    numRuns := *runPtr
    setProb := *setPtr
 
-   mc := memcache.New("localhost:11211")
-   //mc := memcache.New("10.1.212.210:2888")
+   //mc := memcache.New("localhost:11211")
+   mc := memcache.New("10.1.212.210:2888")
    mc.MaxIdleConns = numClients+10//(numClients/2)
    wg := new(sync.WaitGroup)
    start := make(chan bool)
