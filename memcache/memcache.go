@@ -326,16 +326,16 @@ func (c *Client) Get(key string) (item *Item, err error) {
 }
 
 // Ret, regular expression get
-func (c *Client) Ret(ritem *Item) (item *Item, err error) {
+func (c *Client) Ret(ritem *Item, scancount int) (item *Item, err error) {
    if len(ritem.Value) != 32 {
       return nil, fmt.Errorf("memcache: unexpected value length in ret request: %s", ritem.Value)
    }
    err = c.withKeyAddr(ritem.Key, func(addr net.Addr) error {
-      return c.retFromAddr(addr, ritem, func(it *Item) { item = it })
+      return c.retFromAddr(addr, ritem, func(it *Item) { item = it}, scancount )
    })
-   if err == nil && item == nil {
+   /*if err == nil && item == nil {
       err = ErrCacheMiss
-   }
+   }*/
    return
 }
 
@@ -412,7 +412,7 @@ func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error
 	})
 }
 
-func (c *Client) retFromAddr(addr net.Addr, item *Item, cb func(*Item)) error {
+func (c *Client) retFromAddr(addr net.Addr, item *Item, cb func(*Item), scancount int) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
       // Add Zsolt header
       padding := []byte{0, 0, 0, 0, 0, 0, 0, 0}
@@ -448,9 +448,11 @@ func (c *Client) retFromAddr(addr net.Addr, item *Item, cb func(*Item)) error {
 		if err := rw.Flush(); err != nil {
 			return err
 		}
-		if err := parseGetResponse(rw.Reader, cb); err != nil {
-			return err
-		}
+      for i := 0; i < scancount; i++ {
+		   if err := parseGetResponse(rw.Reader, cb); err != nil {
+			   return err
+		   }
+      }
 		return nil
 	})
 }
@@ -553,12 +555,26 @@ func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
    if _, err := r.Discard(8); err != nil {
       return err
    }
+   pline, err := r.Peek(8)
+   if err != nil {
+      return err
+   }
+   if bytes.Contains(pline, []byte("-------")) {
+      r.Discard(8)
+      return nil;
+   }
+
+   totalbytes := 0 //TODO is this necessary, we can simply discard(8) at the end
 	for {		
       line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
 		}
-		if bytes.Equal(line, resultEnd) {
+      totalbytes += len(line)
+		if bytes.Contains(line, resultEnd) {
+         if totalbytes % 8 != 0 {
+            r.Discard(8 - (totalbytes % 8))
+         }
 			return nil
 		}
 		/*it := new(Item)
@@ -703,17 +719,23 @@ func (c *Client) populateOne(rw *bufio.ReadWriter, verb string, item *Item) erro
       return err
    }
 	line, err := rw.ReadSlice('\n')
-	if err != nil {
-		return err
-	}
+   if err != nil {
+      return err
+   }
+   for bytes.Contains(line, []byte("\r")) == false {
+      line, err = rw.ReadSlice('\n')
+	   if err != nil {
+		   return err
+	   }
+   }
 	switch {
-	case bytes.Equal(line, resultStored):
+	case bytes.Contains(line, resultStored):
 		return nil
-	case bytes.Equal(line, resultNotStored):
+	case bytes.Contains(line, resultNotStored):
 		return ErrNotStored
-	case bytes.Equal(line, resultExists):
+	case bytes.Contains(line, resultExists):
 		return ErrCASConflict
-	case bytes.Equal(line, resultNotFound):
+	case bytes.Contains(line, resultNotFound):
 		return ErrCacheMiss
 	}
 	return fmt.Errorf("memcache: unexpected response line from %q: %q", verb, string(line))
