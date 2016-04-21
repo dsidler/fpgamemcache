@@ -3,6 +3,8 @@ package main
 import (
    "github.com/dsidler/fpgamemcache/memcache"
    "fmt"
+   "net"
+   "bufio"
    "os"
    "sync"
    "time"
@@ -95,7 +97,7 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
       prob := oracle.Float64()
       //if runs % 10 == 0 {
       if prob < config.setProb {
-         err := mc.SetJSON(&memcache.Item{Key: keys[keyidx], Value: value})
+         err := mc.Set(&memcache.Item{Key: keys[keyidx], Value: value})
          if err != nil {
             fmt.Println("Error on set: ", err.Error())
             os.Exit(1)
@@ -119,17 +121,79 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
    }*/
 }
 
+func udp_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration) {
+   defer wg.Done()
+   numKeys := 1000
+   oracle := rand.New(rand.NewSource(time.Now().UnixNano()))
+   r := rand.New(rand.NewSource(time.Now().UnixNano()))
+   zipf := rand.NewZipf(r, config.zipfs, 1.0, uint64(numKeys))
+
+   //Create connection
+   conn, err := net.Dial("udp", config.host)
+   if err != nil {
+      fmt.Println("Error on dial: ", err.Error())
+      os.Exit(1)
+   }
+   rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
+
+   // Generate keys
+   keys := GenerateKeys(numKeys)
+   // Generate value
+   value := make([]byte, config.valueLength)
+   for i := 0; i < config.valueLength; i++ {
+      value[i] = letters[i % len(letters)]
+   }
+
+   // Wait for start signal
+   startsig := <-s
+   if !startsig {
+      fmt.Println("Wrong start signal.")
+   }
+
+   runs := 0
+   keyidx := uint64(0)
+   for ; runs < config.numRuns; runs++ {
+      if config.zipfs != 0 {
+         keyidx = zipf.Uint64()
+      } else {
+         keyidx = uint64(runs % numKeys)
+      }
+
+      prob := oracle.Float64()
+      if prob < config.setProb {
+         err := mc.SetUDP(rw, &memcache.Item{Key: keys[keyidx], Value: value})
+         if err != nil {
+            fmt.Println("Error on set: ", err.Error())
+            os.Exit(1)
+         }
+      } else {
+         //TODO regex config
+         //regex := []byte("0123456789abcdef0123456789abcdef")
+         _, err := mc.GetUDP(rw, keys[keyidx])
+         //_, err := mc.Ret(&memcache.Item{Key: keys[keyidx], Value: regex})
+         if err != nil {
+            fmt.Println("Error on get: ", err.Error())
+            os.Exit(1)
+
+         }
+      }
+
+   }
+}
+
 //var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
 
 
 func main() {
    //runtime.GOMAXPROCS(8)
    hostPtr := flag.String("host", "10.1.212.209:2888", "host addr and port")
+   udpPtr := flag.Bool("udp", false, "use UDP")
    numPtr := flag.Int("clients", 1, "number of clients")
    runPtr := flag.Int("runs", 1, "number of runs per client")
    setPtr := flag.Float64("setp", 0.1, "probability of set")
    valuePtr := flag.Int("vallen", 32, "length of value")
    zipfPtr := flag.Float64("zipfs", 0.0, "zipf value s")
+   zsoltPtr := flag.Bool("zsolt", true, "use zsolts protocol")
    flag.Parse()
 
    /*if *cpuprofile != "" {
@@ -141,6 +205,7 @@ func main() {
      defer pprof.StopCPUProfile()
    }*/
 
+   useUDP := *udpPtr
    config := configuration {
                host: *hostPtr,
                numClients: *numPtr,
@@ -163,6 +228,7 @@ func main() {
    mc.MaxIdleConns = config.numClients+10//(numClients/2)
    // set network timeout
    mc.Timeout = 5000 * time.Millisecond
+   mc.UseZsolt = *zsoltPtr
 
    wg := new(sync.WaitGroup)
    start := make(chan bool)
@@ -170,7 +236,11 @@ func main() {
    // start clients
    for i := 0; i < config.numClients; i++ {
       wg.Add(1)
-      go client(wg, start, mc, &config)
+      if useUDP {
+         go udp_client(wg, start, mc, &config)
+      } else {
+         go client(wg, start, mc, &config)
+      }
    }
 
    // wait for clients to setup
