@@ -17,43 +17,48 @@ import (
 type configuration struct {
    host        string
    numClients  int 
-   numRuns     int
+   runtime     int
+   scans       int
    setProb     float64
    valueLength int
    zipfs       float64
+   regex       bool
+}
+
+type statistics struct {
+   reqs int
+   sets int
+   gets int
+   miss int
+   setErrors int
+   getErrors int
 }
 const letters = "0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz"
 
 func GenerateKeys(numKeys int) []string {
-   // Generate base key
-   key := make([]byte, 16)
-   for i := 0; i < 16; i++ {
-      key[i] = letters[i % len(letters)] //TODO randomize
-   }
    keys := make([]string, numKeys)
-   temp := make([]byte, 16)
-   // Gnerate 1K keys, in range
+   // Generate keys in range
    pre := 0
    for i := 0; i < numKeys; i++ {
-      for j := 0; j < 12; j++ {
-         temp[j] = key[j];
-      }
-      for j := 12; j < 14; j++ {
-         temp[j] = letters[0];
-      }
-      temp[14] = letters[pre % len(letters)];
-      temp[15] = letters[i % len(letters)];
-      if (i % len(letters)) == 0 {
+      keys[i] = "foobarba" + string(letters[i % len(letters)]) + string(letters[pre % len(letters)]) +"xxxxzz"
+      if i+1 % len(letters) == 0 {
          pre++;
       }
-      keys[i] = string(temp)
+   }
+
+   // Check key length
+   for _,key := range(keys) {
+      if len(key) != 16 {
+         fmt.Println("Error: key has unexpected length: ", len(key))
+         os.Exit(1)
+      }
    }
    return keys
 }
 
 //TODO Generate Skewed Keys
 
-func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration) {
+func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration, statschan chan statistics) {
    defer wg.Done()
    numKeys := 1000
    /*if config.zipfs != 0 {
@@ -63,12 +68,30 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
    r := rand.New(rand.NewSource(time.Now().UnixNano()))
    zipf := rand.NewZipf(r, config.zipfs, 1.0, uint64(numKeys))
 
+   if config.regex {
+      config.valueLength -= 2
+   }
+
    // Generate keys
    keys := GenerateKeys(numKeys)
    // Generate value
    value := make([]byte, config.valueLength)
    for i := 0; i < config.valueLength; i++ {
       value[i] = letters[i % len(letters)]
+   }
+
+   stats := statistics{reqs: 0, sets: 0, gets: 0, setErrors: 0, getErrors: 0}
+
+   // Open a connection by issuing a set/get
+   var err error
+   if config.regex {
+      err = mc.SetJSON(&memcache.Item{Key: keys[0], Value: value})
+   } else {
+      err = mc.Set(&memcache.Item{Key: keys[0], Value: value})
+   }
+   if err != nil {
+      fmt.Println("Error on open/set connection: ", err.Error())
+      //os.Exit(1)
    }
 
    // Wait for start signal
@@ -80,13 +103,21 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
    //map for zipf, for debug
    //distr := make(map[string]int)
 
-   runs := 0
    keyidx := uint64(0)
-   for ; runs < config.numRuns; runs++ {
+   for {
+      select {
+      case stopsig := <-s:
+         //fmt.Println("go signal")
+         if !stopsig {
+            statschan <- stats
+            return
+         }
+      default:
+      stats.reqs++
       if config.zipfs != 0 {
          keyidx = zipf.Uint64()
       } else {
-         keyidx = uint64(runs % numKeys)
+         keyidx = uint64(stats.reqs % numKeys)
       }
       // For debug only
       /*if _, ok := distr[keys[keyidx]]; !ok{
@@ -95,33 +126,143 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
       distr[keys[keyidx]]++*/
 
       prob := oracle.Float64()
+      var err error
       //if runs % 10 == 0 {
       if prob < config.setProb {
-         err := mc.Set(&memcache.Item{Key: keys[keyidx], Value: value})
+         if config.regex {
+            err = mc.SetJSON(&memcache.Item{Key: keys[keyidx], Value: value})
+         } else {
+            err = mc.Set(&memcache.Item{Key: keys[keyidx], Value: value})
+         }
          if err != nil {
             fmt.Println("Error on set: ", err.Error())
-            os.Exit(1)
+            stats.setErrors++
+            //os.Exit(1)
+         } else {
+            stats.sets++
          }
       } else {
          //TODO regex config
-         //regex := []byte("0123456789abcdef0123456789abcdef")
-         _, err := mc.Get(keys[keyidx])
-         //_, err := mc.Ret(&memcache.Item{Key: keys[keyidx], Value: regex})
+         regex := []byte("0123456789abcdef0123456789abcdef")
+         if config.regex {
+            _, err = mc.Ret(&memcache.Item{Key: keys[keyidx], Value: regex}, config.scans)
+         } else {
+            _, err = mc.Get(keys[keyidx], config.scans)
+         }
          if err != nil {
-            fmt.Println("Error on get: ", err.Error())
-            os.Exit(1)
-
+            fmt.Println("Error on get/ret: ", err.Error())
+            stats.getErrors++
+            //os.Exit(1)
+         } else {
+            stats.gets++
          }
       }
 
-   }
+   } //select
+   } //for
    //print out distribution, for debug
    /*for s,c := range distr {
       fmt.Println(s, "\t", c)
    }*/
 }
 
-func udp_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration) {
+func regex_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration, statschan chan statistics) {
+   defer wg.Done()
+   numKeys := 1000
+
+   if config.regex {
+      config.valueLength -= 2
+   }
+
+   // Generate keys
+   keys := GenerateKeys(numKeys)
+   // Generate value
+   value := make([]byte, config.valueLength)
+   for i := 0; i < config.valueLength; i++ {
+      value[i] = letters[i % len(letters)]
+   }
+   matchingValue :=  append([]byte("0123456789abcdef"), value[32:]...)
+   matchingValue = append(matchingValue, []byte("systemsgroupethz")...)
+
+   stats := statistics{reqs: 0, sets: 0, gets: 0, miss: 0, setErrors: 0, getErrors: 0}
+
+   // Open a connection by issuing a set/get
+   var err error
+   if config.regex {
+      err = mc.SetJSON(&memcache.Item{Key: keys[0], Value: value})
+   } else {
+      err = mc.Set(&memcache.Item{Key: keys[0], Value: value})
+   }
+   if err != nil {
+      fmt.Println("Error on open/set connection: ", err.Error())
+      //os.Exit(1)
+   }
+
+   // Wait for start signal
+   startsig := <-s
+   if !startsig {
+      fmt.Println("Wrong start signal.")
+   }
+
+   keyidx := uint64(0)
+   doSets := true
+   numKeys -= config.scans
+   for {
+      select {
+      case stopsig := <-s:
+         //fmt.Println("go signal")
+         if !stopsig {
+            statschan <- stats
+            return
+         }
+      default:
+      var err error
+      if doSets {
+         for i := 0; i < config.scans; i++ {
+            stats.reqs++
+            if i % 2 == 0 {
+               err = mc.SetJSON(&memcache.Item{Key: keys[keyidx+uint64(i)], Value: value})
+            } else {
+               err = mc.SetJSON(&memcache.Item{Key: keys[keyidx+uint64(i)], Value: matchingValue})
+            }
+            if err != nil {
+               fmt.Println("Error on set: ", err.Error())
+               stats.setErrors++
+               //os.Exit(1)
+            } else {
+               stats.sets++
+            }
+         } //for
+         doSets = false
+      } else {
+         stats.reqs++
+         //regex := []byte("0123456789abcdef0123456789abcdef")
+         regex := []byte("0123456789abcdefsystemsgroupethz")
+         it, err := mc.Ret(&memcache.Item{Key: keys[keyidx], Value: regex}, config.scans)
+         if err != nil {
+            fmt.Println("Error on get/ret: ", err.Error())
+            stats.getErrors++
+            //os.Exit(1)
+         } else {
+            stats.gets++
+         }
+         if it == nil {
+            stats.miss++
+         }
+         //update key
+         keyidx = uint64(stats.reqs % numKeys)
+         doSets = true
+      }
+
+   } //select
+   } //for
+   //print out distribution, for debug
+   /*for s,c := range distr {
+      fmt.Println(s, "\t", c)
+   }*/
+}
+
+func udp_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration, statschan chan statistics) {
    defer wg.Done()
    numKeys := 1000
    oracle := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -144,41 +285,60 @@ func udp_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *c
       value[i] = letters[i % len(letters)]
    }
 
+   stats := statistics{reqs: 0, sets: 0, gets: 0, setErrors: 0, getErrors: 0}
+
    // Wait for start signal
    startsig := <-s
    if !startsig {
       fmt.Println("Wrong start signal.")
    }
 
-   runs := 0
-   keyidx := uint64(0)
-   for ; runs < config.numRuns; runs++ {
+      keyidx := uint64(0)
+   //for ; runs < config.numRuns; runs++ {
+   for {
+      select {
+   case stopsig := <-s:
+      fmt.Println("go signal")
+      if !stopsig {
+         statschan <- stats
+         return
+      }
+   default:
+      stats.reqs++ //TODO what about fails??
       if config.zipfs != 0 {
          keyidx = zipf.Uint64()
       } else {
-         keyidx = uint64(runs % numKeys)
+         keyidx = uint64(stats.reqs % numKeys)
       }
 
       prob := oracle.Float64()
+
+      conn.SetReadDeadline(time.Now().Add(1000 * time.Millisecond))
       if prob < config.setProb {
          err := mc.SetUDP(rw, &memcache.Item{Key: keys[keyidx], Value: value})
          if err != nil {
             fmt.Println("Error on set: ", err.Error())
-            os.Exit(1)
+            stats.setErrors++
+            //os.Exit(1)
+         } else {
+            stats.sets++
          }
       } else {
          //TODO regex config
          //regex := []byte("0123456789abcdef0123456789abcdef")
-         _, err := mc.GetUDP(rw, keys[keyidx])
-         //_, err := mc.Ret(&memcache.Item{Key: keys[keyidx], Value: regex})
+         _, err := mc.GetUDP(rw, keys[keyidx], config.scans)
+         //_, err := mc.RetUDP(rw, &memcache.Item{Key: keys[keyidx], Value: regex}, config.scans)
          if err != nil {
             fmt.Println("Error on get: ", err.Error())
-            os.Exit(1)
-
+            stats.getErrors++
+            //os.Exit(1)
+         } else {
+            stats.gets++
          }
       }
-
-   }
+      } // select
+   } //for
+   fmt.Println("done")
 }
 
 //var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
@@ -189,11 +349,13 @@ func main() {
    hostPtr := flag.String("host", "10.1.212.209:2888", "host addr and port")
    udpPtr := flag.Bool("udp", false, "use UDP")
    numPtr := flag.Int("clients", 1, "number of clients")
-   runPtr := flag.Int("runs", 1, "number of runs per client")
+   timePtr := flag.Int("time", 10, "runtime in seconds")
+   scanPtr := flag.Int("scans", 1, "number of scans")
    setPtr := flag.Float64("setp", 0.1, "probability of set")
-   valuePtr := flag.Int("vallen", 32, "length of value")
+   valuePtr := flag.Int("vallen", 64, "length of value")
    zipfPtr := flag.Float64("zipfs", 0.0, "zipf value s")
    zsoltPtr := flag.Bool("zsolt", true, "use zsolts protocol")
+   regexPtr := flag.Bool("regex", false, "use regex mode")
    flag.Parse()
 
    /*if *cpuprofile != "" {
@@ -209,14 +371,18 @@ func main() {
    config := configuration {
                host: *hostPtr,
                numClients: *numPtr,
-               numRuns: *runPtr,
+               runtime: *timePtr,
+               scans: *scanPtr,
                setProb: *setPtr,
                valueLength: *valuePtr,
-               zipfs: *zipfPtr}
-   if config.valueLength < 32 {
-      fmt.Println("value length too short, must be at least 32")
+               zipfs: *zipfPtr,
+               regex: *regexPtr}
+   if config.valueLength % 64  != 0 {
+      fmt.Println("value length Must be multiple of 64")
       os.Exit(1)
    }
+   // Adapt value length
+   config.valueLength -= 8
    if config.zipfs != 0 && config.zipfs <= 1 {
       fmt.Println("zifps must be >1 or 0.0")
       os.Exit(1)
@@ -232,14 +398,19 @@ func main() {
 
    wg := new(sync.WaitGroup)
    start := make(chan bool)
+   statschan := make(chan statistics)
 
    // start clients
    for i := 0; i < config.numClients; i++ {
       wg.Add(1)
       if useUDP {
-         go udp_client(wg, start, mc, &config)
+         go udp_client(wg, start, mc, &config, statschan)
       } else {
-         go client(wg, start, mc, &config)
+         if config.regex {
+            go regex_client(wg, start, mc, &config, statschan)
+         } else {
+            go client(wg, start, mc, &config, statschan)
+         }
       }
    }
 
@@ -251,11 +422,35 @@ func main() {
    for i := 0; i < config.numClients; i++ {
       start <- true
    }
+   // Run for x seconds
+   time.Sleep(time.Duration(config.runtime) * time.Second)
+
+   // Stop clients
+   fmt.Println("Stopping...")
+   for i :=0; i < config.numClients; i++ {
+      start <- false
+   }
+   stats := make([]statistics, config.numClients)
+   gstats := statistics{reqs: 0, sets: 0, gets: 0, miss: 0, setErrors: 0, getErrors: 0}
+   for i :=0; i < config.numClients; i++ {
+      stats[i] = <- statschan
+      gstats.reqs += stats[i].reqs
+      gstats.sets += stats[i].sets
+      gstats.gets += stats[i].gets
+      gstats.setErrors += stats[i].setErrors
+      gstats.getErrors += stats[i].getErrors
+   }
    wg.Wait()
    duration := time.Since(starttime).Seconds()
 
-   numReqs := config.numRuns*config.numClients
-   fmt.Printf("Throughput[KReq/s]: %2f\n", float64(numReqs) / duration / 1000)
-   fmt.Printf("Duration[ms]: %2f\n", duration*1000)
+   fmt.Println("----------------------------")
+   fmt.Printf("Throughput[KReq/s]: %2f\n", float64(gstats.reqs) / duration / 1000)
+   fmt.Printf("Duration[s]: %2f\n", duration)
+   fmt.Println("Requests: ", gstats.reqs)
+   fmt.Println("Sets: ", gstats.sets)
+   fmt.Println("Gets: ", gstats.gets)
+   fmt.Println("Misses: ", gstats.miss)
+   fmt.Println("Set errors: ", gstats.setErrors)
+   fmt.Println("Get errors: ", gstats.getErrors)
 
 }

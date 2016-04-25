@@ -319,9 +319,9 @@ func (c *Client) FlushAll() error {
 
 // Get gets the item for the given key. ErrCacheMiss is returned for a
 // memcache cache miss. The key must be at most 250 bytes in length.
-func (c *Client) Get(key string) (item *Item, err error) {
+func (c *Client) Get(key string, scancount int) (item *Item, err error) {
 	err = c.withKeyAddr(key, func(addr net.Addr) error {
-		return c.getFromAddr(addr, []string{key}, func(it *Item) { item = it })
+		return c.getFromAddr(addr, []string{key}, func(it *Item) { item = it }, scancount)
 	})
 	/*if err == nil && item == nil {
 		err = ErrCacheMiss
@@ -344,12 +344,12 @@ func (c *Client) Ret(ritem *Item, scancount int) (item *Item, err error) {
 }
 
 // GET over UDP
-func (c *Client) GetUDP(rw *bufio.ReadWriter, key string) (item *Item, err error) {
-   err = c.getFromUDP(rw, []string{key}, func(it *Item) { item = it })
+func (c *Client) GetUDP(rw *bufio.ReadWriter, key string, scancount int) (item *Item, err error) {
+   err = c.getFromUDP(rw, []string{key}, scancount, func(it *Item) { item = it })
    return
 }
 
-func (c *Client) getFromUDP(rw *bufio.ReadWriter, keys []string, cb func(*Item)) error {
+func (c *Client) getFromUDP(rw *bufio.ReadWriter, keys []string, scancount int, cb func(*Item)) error {
 
    // Add Zsolt header
    padding := []byte{0, 0, 0, 0, 0, 0, 0, 0}
@@ -381,14 +381,16 @@ func (c *Client) getFromUDP(rw *bufio.ReadWriter, keys []string, cb func(*Item))
 	if err := rw.Flush(); err != nil {
 		return err
 	}
-   if c.UseZsolt {
-	   if err := parseZsoltResponse(rw.Reader, cb); err != nil {
-		   return err
-	   }
-   } else {
-	   if err := parseGetResponse(rw.Reader, cb); err != nil {
-		   return err
-	   }
+   for i := 0; i < scancount; i++ {
+      if c.UseZsolt {
+	      if err := parseZsoltResponse(rw.Reader, cb); err != nil {
+		      return err
+	      }
+      } else {
+	      if err := parseGetResponse(rw.Reader, cb); err != nil {
+		      return err
+	      }
+      }
    }
 	return nil
 }
@@ -438,7 +440,7 @@ func (c *Client) retFromUDP(rw *bufio.ReadWriter, item *Item, scancount int, cb 
 	}
    for i := 0; i < scancount; i++ {
       if c.UseZsolt {
-	      if err := parseZsoltResponse(rw.Reader, cb); err != nil {
+	      if err := parseZsoltRetResponse(rw.Reader, cb); err != nil {
 		      return err
 	      }
       } else {
@@ -486,7 +488,7 @@ func (c *Client) withKeyRw(key string, fn func(*bufio.ReadWriter) error) error {
 	})
 }
 
-func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error {
+func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item), scancount int) error {
 	return c.withAddrRw(addr, func(rw *bufio.ReadWriter) error {
       // Add Zsolt header
       padding := []byte{0, 0, 0, 0, 0, 0, 0, 0}
@@ -518,14 +520,16 @@ func (c *Client) getFromAddr(addr net.Addr, keys []string, cb func(*Item)) error
 		if err := rw.Flush(); err != nil {
 			return err
 		}
-      if c.UseZsolt {
-		   if err := parseZsoltResponse(rw.Reader, cb); err != nil {
-			   return err
-		   }
-      } else {
-		   if err := parseGetResponse(rw.Reader, cb); err != nil {
-			   return err
-		   }
+      for i := 0; i < scancount; i++ {
+         if c.UseZsolt {
+		      if err := parseZsoltResponse(rw.Reader, cb); err != nil {
+			      return err
+		      }
+         } else {
+		      if err := parseGetResponse(rw.Reader, cb); err != nil {
+			      return err
+		      }
+         }
       }
 		return nil
 	})
@@ -571,7 +575,7 @@ func (c *Client) retFromAddr(addr net.Addr, item *Item, cb func(*Item), scancoun
 		}
       for i := 0; i < scancount; i++ {
          if c.UseZsolt {
-		      if err := parseZsoltResponse(rw.Reader, cb); err != nil {
+		      if err := parseZsoltRetResponse(rw.Reader, cb); err != nil {
 			      return err
 		      }
          } else {
@@ -662,7 +666,7 @@ func (c *Client) GetMulti(keys []string) (map[string]*Item, error) {
 	ch := make(chan error, buffered)
 	for addr, keys := range keyMap {
 		go func(addr net.Addr, keys []string) {
-			ch <- c.getFromAddr(addr, keys, addItemToMap)
+			ch <- c.getFromAddr(addr, keys, addItemToMap, 1)
 		}(addr, keys)
 	}
 
@@ -727,49 +731,69 @@ func parseGetResponse(r *bufio.Reader, cb func(*Item)) error {
 // parseGetResponse reads a GET response from r and calls cb for each
 // read and allocated Item
 func parseZsoltResponse(r *bufio.Reader, cb func(*Item)) error {
-   
    if _, err := r.Discard(8); err != nil {
       return err
    }
-   pline, err := r.Peek(8)
+   pline, err := r.Peek(4)
    if err != nil {
       return err
    }
-   if bytes.Contains(pline, []byte("-------")) {
-      r.Discard(8)
+   if bytes.Contains(pline, []byte("----")) {
+      if _,err := r.Discard(8); err != nil {
+         return err
+      }
       return nil;
    }
 
-   totalbytes := 0 //TODO is this necessary, we can simply discard(8) at the end
-	for {		
+   //totalbytes := 0 //TODO is this necessary, we can simply discard(8) at the end
+	for {
       line, err := r.ReadSlice('\n')
 		if err != nil {
 			return err
 		}
-      totalbytes += len(line)
+      //totalbytes += len(line)
 		if bytes.Contains(line, resultEnd) {
-         if totalbytes % 8 != 0 {
+         /*if totalbytes % 8 != 0 {
             r.Discard(8 - (totalbytes % 8))
-         }
+         }*/
 			return nil
 		}
-		/*it := new(Item)
-		size, err := scanGetResponseLine(line, it)
-		if err != nil {
-			return err
-		}
-		//it.Value, err = ioutil.ReadAll(io.LimitReader(r, int64(size)+2))
-      it.Value = make([]byte, int64(size) + 2)
-      _, err = io.ReadFull(r, it.Value)
-		if err != nil {
-			return err
-		}
-		if !bytes.HasSuffix(it.Value, crlf) {
-			return fmt.Errorf("memcache: corrupt get result read")
-		}
-		it.Value = it.Value[:size]
-		cb(it)*/
 	}
+}
+
+func parseZsoltRetResponse(r *bufio.Reader, cb func(*Item)) error {
+   if _, err := r.Discard(8); err != nil {
+      return err
+   }  
+
+   pline, err := r.Peek(8)
+
+   if err!=nil {
+      return err     
+   }
+
+   if bytes.Contains(pline, []byte("-------")) {
+      _, _ = r.Discard(8)
+      return nil;
+   }
+
+
+   totalbytes := 0
+   for {          
+      line, err := r.ReadSlice('\n')
+      if err != nil {
+         return err
+      }     
+
+      totalbytes += len(line)
+
+      if bytes.Contains(line, resultEnd) {                  
+         if totalbytes % 8 !=0 {
+            r.Discard(8-( totalbytes % 8 ))
+         }
+         return nil
+      }
+   }
 }
 
 // scanGetResponseLine populates it and returns the declared size of the item.
