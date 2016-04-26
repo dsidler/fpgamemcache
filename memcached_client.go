@@ -23,6 +23,7 @@ type configuration struct {
    valueLength int
    zipfs       float64
    regex       bool
+   matchProb   float64
 }
 
 type statistics struct {
@@ -79,6 +80,9 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
    for i := 0; i < config.valueLength; i++ {
       value[i] = letters[i % len(letters)]
    }
+   matchingValue :=  append([]byte("0123456789abcdef"), value[32:]...)
+   matchingValue = append(matchingValue, []byte("systemsgroupethz")...)
+
 
    stats := statistics{reqs: 0, sets: 0, gets: 0, setErrors: 0, getErrors: 0}
 
@@ -130,7 +134,13 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
       //if runs % 10 == 0 {
       if prob < config.setProb {
          if config.regex {
-            err = mc.SetJSON(&memcache.Item{Key: keys[keyidx], Value: value})
+            //matching prob
+            prob := oracle.Float64()
+            if prob < config.matchProb {
+               err = mc.SetJSON(&memcache.Item{Key: keys[keyidx], Value: matchingValue})
+            } else {
+               err = mc.SetJSON(&memcache.Item{Key: keys[keyidx], Value: value})
+            }
          } else {
             err = mc.Set(&memcache.Item{Key: keys[keyidx], Value: value})
          }
@@ -143,7 +153,7 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
          }
       } else {
          //TODO regex config
-         regex := []byte("0123456789abcdef0123456789abcdef")
+         regex := []byte("0123456789abcdefsystemsgroupethz")
          if config.regex {
             _, err = mc.Ret(&memcache.Item{Key: keys[keyidx], Value: regex}, config.scans)
          } else {
@@ -166,7 +176,7 @@ func client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *confi
    }*/
 }
 
-func regex_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration, statschan chan statistics) {
+func scan_client(wg * sync.WaitGroup, s chan bool, mc *memcache.Client, config *configuration, statschan chan statistics) {
    defer wg.Done()
    numKeys := 1000
 
@@ -356,6 +366,7 @@ func main() {
    zipfPtr := flag.Float64("zipfs", 0.0, "zipf value s")
    zsoltPtr := flag.Bool("zsolt", true, "use zsolts protocol")
    regexPtr := flag.Bool("regex", false, "use regex mode")
+   matchPtr := flag.Float64("regexmatch", 0.5, "probability of regex match")
    flag.Parse()
 
    /*if *cpuprofile != "" {
@@ -376,7 +387,8 @@ func main() {
                setProb: *setPtr,
                valueLength: *valuePtr,
                zipfs: *zipfPtr,
-               regex: *regexPtr}
+               regex: *regexPtr,
+               matchProb: *matchPtr}
    if config.valueLength % 64  != 0 {
       fmt.Println("value length Must be multiple of 64")
       os.Exit(1)
@@ -406,8 +418,8 @@ func main() {
       if useUDP {
          go udp_client(wg, start, mc, &config, statschan)
       } else {
-         if config.regex {
-            go regex_client(wg, start, mc, &config, statschan)
+         if config.scans != 1 {
+            go scan_client(wg, start, mc, &config, statschan)
          } else {
             go client(wg, start, mc, &config, statschan)
          }
